@@ -1,0 +1,252 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Iata demo template'
+Resources:
+
+  #s3 bucket
+  MyS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: iata-demo
+      VersioningConfiguration:
+        Status: Enabled 
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: KMS-KEY-ARN
+            BucketKeyEnabled: true
+    DeletionPolicy: Delete
+
+  #Layer
+  s3fs:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+        - python3.9
+      Content:
+        S3Bucket: iata-demo2
+        S3Key: package/s3fs.zip
+      Description: s3fs layer
+      LayerName: s3fs
+    DependsOn: MyS3Bucket
+
+  # Step functions state machine
+  IataDemoStepfunction:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: Iata-demo-stepfunction
+      DefinitionString: !Sub |
+        {
+          "Comment": "A description of my state machine",
+          "StartAt": "Fecth File",
+          "States": {
+            "Fecth File": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+              "Parameters": {
+                "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:lightFetcher:$LATEST",
+                "Payload": {
+                  "token.$": "$$.Task.Token",
+                  "executionId.$": "$$.Execution.Id"
+                }
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "IntervalSeconds": 1,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ],
+              "Next": "Uncompress File",
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "Pass"
+                }
+              ]
+            },
+            "Pass": {
+              "Type": "Pass",
+              "End": true
+            },
+            "Uncompress File": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+              "Parameters": {
+                "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:Uncompress:$LATEST",
+                "Payload": {
+                  "token.$": "$$.Task.Token",
+                  "executionId.$": "$$.Execution.Id"
+                }
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "IntervalSeconds": 1,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ],
+              "Next": "Parquet Converter",
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "Pass 2"
+                }
+              ]
+            },
+            "Pass 2": {
+              "Type": "Pass",
+              "End": true
+            },
+            "Parquet Converter": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+              "Parameters": {
+                "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:parquetConverter:$LATEST",
+                "Payload": {
+                  "token.$": "$$.Task.Token",
+                  "executionId.$": "$$.Execution.Id"
+                }
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "IntervalSeconds": 1,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ],
+              "End": true
+            }
+          }
+        }
+      RoleArn: !GetAtt IataDemoStepfunctionRole.Arn
+    DependsOn: 
+      - LightFetcher
+      - Uncompress
+      - ParquetConverter
+      - IataDemoStepfunctionRole
+
+  # Lambda functions
+  LightFetcher: 
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: lightFetcher
+      Code: 
+        S3Bucket: iata-demo2
+        S3Key: scripts/fetcher.zip
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt IataDemoLambdaRole.Arn
+      Runtime: 'python3.9'
+      Architectures:
+        - x86_64
+      Layers:
+        - arn:aws:lambda:us-east-1:336392948345:layer:AWSSDKPandas-Python39:25
+    DependsOn: 
+      - IataDemoLambdaRole
+
+  Uncompress: 
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: Uncompress
+      Code:
+        S3Bucket: iata-demo2
+        S3Key: scripts/uncompress.zip
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt IataDemoLambdaRole.Arn
+      Runtime: 'python3.9'
+      Architectures:
+        - x86_64
+      Layers:
+        - arn:aws:lambda:us-east-1:336392948345:layer:AWSSDKPandas-Python39:25
+        - !Ref s3fs
+    DependsOn:
+      - s3fs
+      - IataDemoLambdaRole
+
+  ParquetConverter: 
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: parquetConverter
+      Code:
+        S3Bucket: 'iata-demo2'
+        S3Key: 'scripts/converter.zip'
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt IataDemoLambdaRole.Arn
+      Runtime: python3.9
+      Architectures:
+        - x86_64
+      Layers:
+        - arn:aws:lambda:us-east-1:336392948345:layer:AWSSDKPandas-Python39:25
+    DependsOn: 
+      - IataDemoLambdaRole
+
+  # IAM roles
+  IataDemoLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: !Sub states.${AWS::Region}.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: iata-demo-lambda-ingestion
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action: 
+              - glue:CreateTable
+              - glue:CreateDatabase
+              - glue:GetDatabase
+              - glue:GetTable
+              - glue:BatchGetPartition
+              - glue:BatchCreatePartition
+              - glue:BatchDeletePartition
+              - s3:GetObject
+              - s3:DeleteObject
+              - s3:PutObject
+              - s3:ListBucket
+              - states:SendTaskFailure
+              - states:SendTaskSuccess
+              - states:SendTaskHeartbeat
+            Resource: 
+              - arn:aws:glue:*
+              - arn:aws:s3:*
+              - arn:aws:states:*
+  
+  IataDemoStepfunctionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaRole
